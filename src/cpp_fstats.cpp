@@ -1,6 +1,7 @@
 // [[Rcpp::plugins(cpp11)]]
 // [[Rcpp::depends(RcppArmadillo)]]
 #include <RcppArmadillo.h>
+#include <cmath>
 using namespace Rcpp;
 using namespace arma;
 
@@ -75,6 +76,92 @@ List cpp_aftable_to_dstatnum(arma::mat& aftable, arma::vec& p1, arma::vec& p2, a
   }
   //return num;
   return Rcpp::List::create(_["num"] = num, _["cnt"] = cnt);
+}
+
+
+// Streaming variant of cpp_aftable_to_dstatnum.
+//
+// Mathematically equivalent to:
+//   tmp = cpp_aftable_to_dstatnum(...)
+//   list(means = rowMeans(tmp$num, na.rm = TRUE), cnt = tmp$cnt)
+//
+// but accumulates per-row sum and count in scalars instead of materializing
+// the full (p1.n_elem x aftable.n_cols) matrix. This serves callers that
+// only need the row means (currently the f4mode path in
+// f4blockdat_from_geno when no per-SNP weights are applied).
+//
+// Two motivations:
+//
+//  1. Memory: on dense f-statistic runs (npopcomb in the millions, blocks
+//     of a few thousand SNPs) the materialized matrix is many GB transient.
+//     Streaming brings per-block peak from O(p1.n_elem * aftable.n_cols)
+//     down to O(p1.n_elem).
+//
+//  2. Armadillo 32-bit indexing: arma::mat element access uses signed
+//     32-bit indices by default. p1.n_elem * aftable.n_cols overflows
+//     INT_MAX (~2.1e9) at roughly 2742 SNPs/block on a 1.57M-popcomb run,
+//     causing silent wraparound or a hard crash before this PR. Streaming
+//     never allocates that matrix and so is unaffected.
+//
+// The poly_only / usesnps / allsnps semantics, NA propagation, and `cnt`
+// definition match cpp_aftable_to_dstatnum exactly; the only change is
+// that `means` (= sum / cnt, which yields NaN when cnt == 0, matching
+// rowMeans on an all-NA row) is returned in place of `num`.
+//
+// [[Rcpp::export]]
+List cpp_aftable_to_dstatnum_rowmeans(arma::mat& aftable,
+                                      arma::vec& p1, arma::vec& p2,
+                                      arma::vec& p3, arma::vec& p4,
+                                      arma::vec& modelvec,
+                                      arma::mat& usesnps,
+                                      bool allsnps, int poly_only) {
+
+  vec sum_v = zeros<vec>(p1.n_elem);
+  vec cnt   = zeros<vec>(p1.n_elem);
+  NumericVector uni;
+
+  double w, x, y, z, val;
+  int i1, i2, i3, i4, m, valid = 0;
+  for(int j = 0; j < (int)p1.n_elem; j++) {
+    i1 = p1(j)-1;
+    i2 = p2(j)-1;
+    i3 = p3(j)-1;
+    i4 = p4(j)-1;
+    if(!allsnps) m = modelvec(j)-1;
+    for(int i = 0; i < (int)aftable.n_cols; i++) {
+      if(allsnps || usesnps(m, i)) {
+        w = aftable(i1, i);
+        x = aftable(i2, i);
+        y = aftable(i3, i);
+        z = aftable(i4, i);
+        if(!(poly_only && allsnps)) {
+          valid = 1;
+        } else {
+          uni = na_omit(unique(NumericVector::create(w, x, y, z)));
+          if(poly_only == 0 || uni.length() > 1 ||
+             (poly_only == 2 && (max(uni) > 0.0001 && max(uni) < 0.9999))) {
+            valid = 1;
+          }
+        }
+        if(valid) {
+          val = (w - x) * (y - z);
+          if(std::isfinite(val)) {
+            sum_v(j) += val;
+            cnt(j) += 1;
+          }
+          valid = 0;
+        }
+      }
+    }
+  }
+
+  vec means(p1.n_elem);
+  for(int j = 0; j < (int)p1.n_elem; j++) {
+    // 0/0 -> NaN matches rowMeans(., na.rm=TRUE) on an all-NA row
+    means(j) = sum_v(j) / cnt(j);
+  }
+
+  return Rcpp::List::create(_["means"] = means, _["cnt"] = cnt);
 }
 
 

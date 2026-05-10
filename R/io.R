@@ -2305,12 +2305,25 @@ f4blockdat_from_geno = function(pref, popcombs = NULL, left = NULL, right = NULL
         block_usesnps = (block_usesnps & (popind %>% map(~fn(at[.,,drop=FALSE])) %>% do.call(rbind, .)))+0
       }
     }
-    num = cpp_aftable_to_dstatnum(at, p1, p2, p3, p4, modelvec, block_usesnps, allsnps, poly_only)
-    if(!is.null(snpwt)) {
+    if(is.null(snpwt)) {
+      # Streaming path: avoids the (npopcomb x nsnp) transient matrix.
+      # Equivalent to cpp_aftable_to_dstatnum(...) followed by
+      # rowMeans(num, na.rm=TRUE), but accumulates per-row sum/cnt in
+      # scalars so memory stays O(npopcomb) instead of O(npopcomb*nsnp).
+      # Also avoids 32-bit arma indexing overflow at >~2700 SNPs/block on
+      # million-popcomb runs.
+      rm = cpp_aftable_to_dstatnum_rowmeans(at, p1, p2, p3, p4, modelvec, block_usesnps, allsnps, poly_only)
+      # arma::vec wraps to R as a 1-column matrix; flatten with c() so the
+      # downstream do.call(rbind, ...) over per-block results gives a
+      # (numblocks x npopcomb) matrix rather than (numblocks*npopcomb x 1).
+      res = list(numer = c(rm$means), cnt = c(rm$cnt))
+    } else {
+      # snpwt path needs the full per-SNP matrix to apply column scaling
+      # before the row reduction, so keep the materialized variant.
+      num = cpp_aftable_to_dstatnum(at, p1, p2, p3, p4, modelvec, block_usesnps, allsnps, poly_only)
       num$num = t(t(num$num) * snpwt[(start[i]+1):end[i]])
+      res = list(numer = unname(rowMeans(num$num, na.rm = TRUE)), cnt = c(num$cnt))
     }
-    res = list(numer = unname(rowMeans(num$num, na.rm = TRUE)),
-               cnt   = c(num$cnt))
     if(!f4mode) {
       den = cpp_aftable_to_dstatden(at, p1, p2, p3, p4, modelvec, block_usesnps, allsnps, poly_only)
       res$denom = unname(rowMeans(den, na.rm = TRUE))
