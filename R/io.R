@@ -2286,32 +2286,47 @@ f4blockdat_from_geno = function(pref, popcombs = NULL, left = NULL, right = NULL
     mutate(popind = map(pp, ~match(., pops))) %$% popind
   usesnps = matrix(0)
 
-  numer = denom = cnt = matrix(NA, numblocks, nrow(pc))
-  for(i in 1:numblocks) {
-    if(verbose) alert_info(paste0('Computing ', nrow(pc),' f4-statistics for block ',
-                                  i, ' out of ', numblocks, '...\r'))
+  # Per-block worker. Each call reads its own SNP range and computes
+  # f4-statistics locally, so blocks are independent and can be
+  # parallelized through the active future::plan() (e.g.
+  # plan(multisession, workers = N) before calling this function).
+  # The default plan is sequential, so this preserves the original
+  # behavior for callers who don't set up a parallel plan.
+  process_block = function(i) {
     # replace following two lines with cpp_geno_to_afs?
     gmat = cpp_read_geno(fl, nsnpall, nindall, indvec, start[i], end[i], T, F)[,snpind[[i]]]
     at = gmat_to_aftable(gmat, popvec)
+    block_usesnps = usesnps
     if(!allsnps) {
-      usesnps = popind %>% map(~(colSums(!is.finite(at[.,,drop=FALSE])) == 0)+0) %>% do.call(rbind, .)
+      block_usesnps = popind %>% map(~(colSums(!is.finite(at[.,,drop=FALSE])) == 0)+0) %>% do.call(rbind, .)
       if(poly_only) {
         #fn = function(mat) apply(mat, 2, function(x) length(unique(na.omit(x))) > 1)+0
         fn = function(mat) apply(mat, 2, function(x) length(unique(na.omit(x))) > 1 | !max(na.omit(x)) %in% c(0,1))+0
-        usesnps = (usesnps & (popind %>% map(~fn(at[.,,drop=FALSE])) %>% do.call(rbind, .)))+0
+        block_usesnps = (block_usesnps & (popind %>% map(~fn(at[.,,drop=FALSE])) %>% do.call(rbind, .)))+0
       }
     }
-    num = cpp_aftable_to_dstatnum(at, p1, p2, p3, p4, modelvec, usesnps, allsnps, poly_only)
+    num = cpp_aftable_to_dstatnum(at, p1, p2, p3, p4, modelvec, block_usesnps, allsnps, poly_only)
     if(!is.null(snpwt)) {
       num$num = t(t(num$num) * snpwt[(start[i]+1):end[i]])
     }
-    numer[i,] = unname(rowMeans(num$num, na.rm = TRUE))
-    cnt[i,] = c(num$cnt)
+    res = list(numer = unname(rowMeans(num$num, na.rm = TRUE)),
+               cnt   = c(num$cnt))
     if(!f4mode) {
-      den = cpp_aftable_to_dstatden(at, p1, p2, p3, p4, modelvec, usesnps, allsnps, poly_only)
-      denom[i,] = unname(rowMeans(den, na.rm = TRUE))
+      den = cpp_aftable_to_dstatden(at, p1, p2, p3, p4, modelvec, block_usesnps, allsnps, poly_only)
+      res$denom = unname(rowMeans(den, na.rm = TRUE))
     }
+    res
   }
+
+  if(verbose) alert_info(paste0('Computing ', nrow(pc), ' f4-statistics across ',
+                                numblocks, ' blocks...\n'))
+  results = furrr::future_map(seq_len(numblocks), process_block,
+                              .options = furrr::furrr_options(seed = TRUE))
+
+  numer = do.call(rbind, lapply(results, `[[`, 'numer'))
+  cnt   = do.call(rbind, lapply(results, `[[`, 'cnt'))
+  denom = if(f4mode) matrix(NA, numblocks, nrow(pc))
+          else       do.call(rbind, lapply(results, `[[`, 'denom'))
   if(verbose) cat('\n')
 
   out = pc %>%
