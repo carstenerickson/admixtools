@@ -3225,11 +3225,45 @@ qpfstats = function(pref, pops, include_f2 = TRUE, include_f3 = TRUE, include_f4
   y = matrix_jackknife_est(numer, cnt)
 
   if(verbose) alert_info(paste0('Running regression...\n'))
-  lh = solve((t(x) %*% x) + diag(ncol(x))*0.00001) %*% t(x)
-  b = lh %*% ymat
-  bglob = lh %*% y
 
-  nblocks = ncol(b)
+  # Per-block weighted-least-squares regression with NaN-aware solve.
+  # See PR #112 for the full math derivation. Bytewise-equivalent to the
+  # batched `b = lh %*% ymat` original when no block has NaN; correct
+  # (vs direct per-block reference) when blocks do have NaN. Without
+  # this, any NaN cell in ymat poisons the entire output column.
+  nblocks = ncol(ymat)
+  npairs  = ncol(x)
+  nan_mask_ymat   = !is.finite(ymat)
+  n_nan_per_block = colSums(nan_mask_ymat)
+  any_nan         = sum(n_nan_per_block) > 0
+  ymat_clean = ymat
+  if(any_nan) ymat_clean[nan_mask_ymat] = 0
+
+  A_shared = crossprod(x) + diag(npairs) * 0.00001
+  L_shared = chol(A_shared)
+  rhs_all  = crossprod(x, ymat_clean)
+
+  b = matrix(0, npairs, nblocks)
+  for(i in seq_len(nblocks)) {
+    if(n_nan_per_block[i] == 0L) {
+      b[, i] = backsolve(L_shared, forwardsolve(t(L_shared), rhs_all[, i]))
+    } else {
+      X_S    = x[nan_mask_ymat[, i], , drop = FALSE]
+      A_i    = A_shared - crossprod(X_S)
+      b[, i] = solve(A_i, rhs_all[, i])
+    }
+  }
+
+  nan_mask_y = !is.finite(y)
+  if(any(nan_mask_y)) {
+    y_local           = y
+    y_local[nan_mask_y] = 0
+    X_S_y = x[nan_mask_y, , drop = FALSE]
+    A_y   = A_shared - crossprod(X_S_y)
+    bglob = solve(A_y, crossprod(x, y_local))
+  } else {
+    bglob = backsolve(L_shared, forwardsolve(t(L_shared), crossprod(x, y)))
+  }
   f2blocks = array(0, c(npop, npop, nblocks), list(sp, sp, paste0('l', bl)))
   m = matrix(1:npop^2, npop, npop)
   m2 = matrix(1:npop^2, npop, npop, byrow = T)
