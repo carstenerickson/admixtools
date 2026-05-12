@@ -2568,11 +2568,79 @@ qpfstats = function(pref, pops, include_f2 = TRUE, include_f3 = TRUE, include_f4
   #ymat = ymat/f4pass1$se
   #x = x/f4pass1$se
   if(verbose) alert_info(paste0('Running regression...\n'))
-  lh = solve((t(x) %*% x) + diag(ncol(x))*0.00001) %*% t(x)
-  b = lh %*% ymat
-  bglob = lh %*% y
 
-  nblocks = ncol(b)
+  # Per-block weighted-least-squares regression with NaN-aware solve.
+  #
+  # The original implementation was a single batched matrix multiply:
+  #   lh = solve((t(x) %*% x) + ridge*I) %*% t(x)
+  #   b  = lh %*% ymat
+  # which silently produces NaN-filled `b` whenever any cell of `ymat`
+  # is NaN — and ymat picks up NaN cells whenever some block has no
+  # valid SNPs for some popcomb (a common case on ancient-DNA panels
+  # with missingness). IEEE 754 propagates the NaN through BLAS DGEMM,
+  # poisoning every cell of `b`'s output column for that block.
+  #
+  # The mathematically correct estimator for block i drops NaN popcombs
+  # from BOTH the design matrix and the response:
+  #     beta_i = solve(A_i, t(x_valid_i) %*% ymat_valid_i)
+  # where the _valid_i index excludes rows where ymat[, i] is NaN. Two
+  # simplifications make this fast:
+  #
+  # (a) Right-hand side: t(x_valid_i) %*% ymat_valid_i equals
+  #     t(x) %*% ymat_clean[, i] where ymat_clean has NaN -> 0.
+  #     Zeroed cells contribute 0 to the dot product (mathematically
+  #     identical to dropping them). One BLAS DGEMM on all blocks at
+  #     once produces every right-hand side.
+  #
+  # (b) System matrix: A_i = A_shared - crossprod(X_S_i)
+  #     where A_shared = t(x) %*% x + ridge*I  (computed once)
+  #           X_S_i    = x[NaN popcombs in block i, ]
+  #     Since sum-over-valid = sum-over-all minus sum-over-NaN, the
+  #     per-block system matrix is a cheap "downdate" of A_shared.
+  #
+  # Per-block cost:
+  #   - Fast path (no NaN in block): reuse the shared Cholesky.       ~1 ms
+  #   - Slow path: rebuild A_i = A_shared - crossprod(X_S), solve. ~10 ms
+  #
+  # When no block has NaN, this loop is bytewise-equivalent to the
+  # original batched solve.
+  nblocks = ncol(ymat)
+  npairs  = ncol(x)
+  nan_mask_ymat   = !is.finite(ymat)            # npopcomb x nblocks
+  n_nan_per_block = colSums(nan_mask_ymat)
+  any_nan         = sum(n_nan_per_block) > 0
+  ymat_clean = ymat
+  if(any_nan) ymat_clean[nan_mask_ymat] = 0
+
+  A_shared = crossprod(x) + diag(npairs) * 0.00001    # npairs x npairs
+  L_shared = chol(A_shared)                            # upper triangular
+  rhs_all  = crossprod(x, ymat_clean)                  # npairs x nblocks; one BLAS DGEMM
+
+  b = matrix(0, npairs, nblocks)
+  for(i in seq_len(nblocks)) {
+    if(n_nan_per_block[i] == 0L) {
+      b[, i] = backsolve(L_shared, forwardsolve(t(L_shared), rhs_all[, i]))
+    } else {
+      X_S    = x[nan_mask_ymat[, i], , drop = FALSE]
+      A_i    = A_shared - crossprod(X_S)
+      b[, i] = solve(A_i, rhs_all[, i])
+    }
+  }
+
+  # bglob: same NaN-aware treatment for the global pseudo-f2 vector.
+  # NaN in y means a popcomb has no valid blocks anywhere — drop it
+  # from the regression via the same downdate trick.
+  nan_mask_y = !is.finite(y)
+  if(any(nan_mask_y)) {
+    y_local           = y
+    y_local[nan_mask_y] = 0
+    X_S_y = x[nan_mask_y, , drop = FALSE]
+    A_y   = A_shared - crossprod(X_S_y)
+    bglob = solve(A_y, crossprod(x, y_local))
+  } else {
+    bglob = backsolve(L_shared, forwardsolve(t(L_shared), crossprod(x, y)))
+  }
+
   bl = f4blockdat %>% slice(1:nblocks) %>% pull(length)
   f2blocks = array(0, c(npop, npop, nblocks), list(sp, sp, paste0('l', bl)))
   m = matrix(1:npop^2, npop, npop)
