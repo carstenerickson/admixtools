@@ -3171,7 +3171,8 @@ construct_fstat_matrix = function(popcomb) {
 #' \dontrun{
 #' f2_blocks = qpfstats(geno_prefix, mypops)
 #' }
-qpfstats = function(pref, pops, include_f2 = TRUE, include_f3 = TRUE, include_f4 = TRUE, verbose = TRUE) {
+qpfstats = function(pref, pops, include_f2 = TRUE, include_f3 = TRUE, include_f4 = TRUE,
+                    nan_block_threshold = 0, verbose = TRUE) {
 
   popcomb = tibble()
   sp = sort(pops)
@@ -3211,6 +3212,32 @@ qpfstats = function(pref, pops, include_f2 = TRUE, include_f3 = TRUE, include_f4
   cnt   = f4$cnt
   bl    = f4$block_lengths
   rm(f4)
+
+  # Optional NaN-rich block masking (default off, threshold = 0).
+  # When `nan_block_threshold > 0`, drop blocks whose fraction of NaN
+  # cells in `numer` exceeds the threshold. Useful for ancient-DNA
+  # panels where some blocks fall in regions with severe capture
+  # failures or extreme deamination (typically MHC, centromeres,
+  # libraries with localized degradation): those blocks' f-statistics
+  # are unreliable and dropping them is cleaner than relying on the
+  # per-block NaN-aware regression below to compensate. A common value
+  # is `nan_block_threshold = 0.01` (drop blocks above 1% NaN rate).
+  # Default `0` matches stock admixtools behavior (no masking).
+  if(nan_block_threshold > 0 && nan_block_threshold <= 1) {
+    nan_rate_per_block = rowSums(!is.finite(numer)) / max(1L, ncol(numer))
+    bad_blocks = which(nan_rate_per_block > nan_block_threshold)
+    if(length(bad_blocks) > 0L) {
+      if(verbose) {
+        alert_info(paste0('Masking ', length(bad_blocks), '/', nrow(numer),
+                          ' NaN-rich blocks (rate > ',
+                          format(100 * nan_block_threshold, nsmall = 2),
+                          '%)\n'))
+      }
+      numer = numer[-bad_blocks, , drop = FALSE]
+      cnt   = cnt[-bad_blocks, , drop = FALSE]
+      bl    = bl[-bad_blocks]
+    }
+  }
 
   if(verbose) alert_info(paste0('Constructing matrix...\n'))
   x = construct_fstat_matrix(popcomb)
