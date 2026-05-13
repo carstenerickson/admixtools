@@ -2877,6 +2877,15 @@ f4blockdat_from_geno = function(pref, popcombs = NULL, left = NULL, right = NULL
   block_reader = .make_block_reader(l, pref, nsnpall, nindall, indvec)
   on.exit(block_reader$finalizer(), add = TRUE, after = FALSE)
 
+  # Per-block chromosome assignment for end-of-chrom progress messages.
+  # snpfile$CHR for any kept SNP in block i gives the chromosome — blocks
+  # are partitioned per-chromosome by get_block_lengths(), so all kept SNPs
+  # in a block share a single CHR.
+  block_chr = vapply(seq_len(numblocks), function(i) {
+    snpfile$CHR[snpfile$block == i & snpfile$keep][1]
+  }, character(1))
+  process_start_time = Sys.time()
+
   # Per-block worker. Each call reads its own SNP range and computes
   # f4-statistics locally, so blocks are independent and can be
   # parallelized through the active future::plan() (e.g.
@@ -2931,6 +2940,29 @@ f4blockdat_from_geno = function(pref, popcombs = NULL, left = NULL, right = NULL
   cnt   = do.call(rbind, lapply(results, `[[`, 'cnt'))
   denom = if(f4mode) matrix(NA, numblocks, nrow(pc))
           else       do.call(rbind, lapply(results, `[[`, 'denom'))
+
+  # Per-chromosome rollup, emitted after the parallel loop completes.
+  # Production has process_block running through furrr::future_map, so per-block
+  # timing across the loop isn't meaningful (blocks may complete out of order
+  # under plan(multisession)). We still walk block_chr afterwards so orchestrators
+  # see one line per chromosome — the "still made progress" signal — plus a
+  # final totals line. Per-chrom wall-clock breakdown is dropped here; only the
+  # total time across the parallel pass is reported.
+  if(verbose) {
+    total_sec = as.numeric(difftime(Sys.time(), process_start_time, units = 'secs'))
+    chr_summary = tibble(chr = block_chr, len = block_lengths) %>%
+      filter(!is.na(chr)) %>%
+      group_by(chr) %>%
+      summarize(variants = sum(len), blocks = n(), .groups = 'drop')
+    for(j in seq_len(nrow(chr_summary))) {
+      message(sprintf('[extract_f2] chr%s: %d variants in %d blocks',
+                      chr_summary$chr[j], chr_summary$variants[j], chr_summary$blocks[j]))
+    }
+    mins = floor(total_sec / 60)
+    secs = total_sec - 60 * mins
+    message(sprintf('[extract_f2] done: %d variants across %d block(s) on %d chromosome(s) in %dm%05.2fs',
+                    sum(block_lengths), numblocks, nrow(chr_summary), mins, secs))
+  }
   if(verbose) cat('\n')
 
   out = pc %>%
