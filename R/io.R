@@ -1746,6 +1746,22 @@ extract_f2 = function(pref, outdir, inds = NULL, pops = NULL, blgsize = 0.05, ma
       }, error = function(e) { warning("Could not compute f2 cache id: ", conditionMessage(e)); NA_character_ })
       if(!is.na(cache_id)) writeLines(cache_id, file.path(outdir, '.f2_cache_id'))
 
+      meta = list(
+        schema_version        = 1L,
+        admixtools_version    = as.character(utils::packageVersion("admixtools")),
+        built_at              = format(Sys.time(), "%Y-%m-%dT%H:%M:%SZ", tz = "UTC"),
+        pops                  = dimnames(f2blocks)[[1]],
+        n_snps                = sum(block_lengths),
+        n_blocks              = length(block_lengths),
+        blgsize               = blgsize,
+        maxmiss               = maxmiss,
+        adjust_pseudohaploid  = adjust_pseudohaploid,
+        qpfstats              = TRUE,
+        cache_id              = if(!is.na(cache_id)) cache_id else NULL)
+      writeLines(
+        jsonlite::toJSON(meta, auto_unbox = TRUE, na = "null", null = "null", pretty = FALSE),
+        file.path(outdir, 'cache_metadata.json'))
+
       return()
     }
   }
@@ -1782,6 +1798,34 @@ extract_f2 = function(pref, outdir, inds = NULL, pops = NULL, blgsize = 0.05, ma
                                           apply_corr = apply_corr, qpfstats = qpfstats)),
     error = function(e) { warning("Could not compute f2 cache id: ", conditionMessage(e)); NA_character_ })
   if(!is.na(cache_id)) writeLines(cache_id, file.path(outdir, '.f2_cache_id'))
+
+  bl_path = file.path(outdir, 'block_lengths_f2.rds')
+  n_blocks = if(file.exists(bl_path)) length(readRDS(bl_path)) else NA_integer_
+  meta = list(
+    schema_version        = 1L,
+    admixtools_version    = as.character(utils::packageVersion("admixtools")),
+    built_at              = format(Sys.time(), "%Y-%m-%dT%H:%M:%SZ", tz = "UTC"),
+    pops                  = colnames(afdat$afs),
+    n_snps                = nrow(afdat$snpfile),
+    n_blocks              = n_blocks,
+    blgsize               = blgsize,
+    maxmiss               = maxmiss,
+    minmaf                = minmaf,
+    maxmaf                = maxmaf,
+    minac2                = minac2,
+    auto_only             = auto_only,
+    transitions           = transitions,
+    transversions         = transversions,
+    adjust_pseudohaploid  = adjust_pseudohaploid,
+    poly_only             = poly_only,
+    apply_corr            = apply_corr,
+    afprod                = afprod,
+    fst                   = fst,
+    qpfstats              = FALSE,
+    cache_id              = if(!is.na(cache_id)) cache_id else NULL)
+  writeLines(
+    jsonlite::toJSON(meta, auto_unbox = TRUE, na = "null", null = "null", pretty = FALSE),
+    file.path(outdir, 'cache_metadata.json'))
 
   if(verbose) alert_info(paste0('Data written to ', outdir, '/\n'))
   invisible(afdat$snpfile)

@@ -91,3 +91,26 @@ result_to_json = function(result, fn = NULL, args = list(), file = "",
   writeLines(as.character(json), con = file)
   invisible(file)
 }
+
+
+#' Read the cache metadata sidecar written by extract_f2()
+#'
+#' Reads the `cache_metadata.json` file written by [extract_f2()] into the
+#' f2 output directory and returns it as a named R list. This gives wrappers
+#' and orchestrators a stable API for post-build telemetry (`n_snps`,
+#' `n_blocks`, `pops`, ...) without reaching into the internal `*.rds` layout.
+#'
+#' @export
+#' @param outdir Path to the f2 output directory passed to [extract_f2()].
+#' @return A named list with the fields written by [extract_f2()]:
+#'   `schema_version`, `admixtools_version`, `built_at`, `pops`, `n_snps`,
+#'   `n_blocks`, `blgsize`, `maxmiss`, `adjust_pseudohaploid`, `cache_id`,
+#'   and all other filter arguments that affect output.
+#' @seealso [extract_f2()], [result_to_json()]
+read_f2_cache_metadata = function(outdir) {
+  path = file.path(outdir, 'cache_metadata.json')
+  if(!file.exists(path))
+    stop(paste0("cache_metadata.json not found in '", outdir,
+                "'. Run extract_f2() with an outdir to generate it."))
+  jsonlite::fromJSON(path, simplifyVector = TRUE)
+}
