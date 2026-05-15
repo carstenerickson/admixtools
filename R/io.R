@@ -161,7 +161,7 @@ eigenstrat_to_afs = function(pref, inds = NULL, pops = NULL, numparts = 100,
 
   for(i in 1:numparts) {
 
-    if(verbose && numparts > 1) alert_info(paste0('Reading part ', i,' of ', numparts,'...\r'))
+    if(verbose && numparts > 1) message(sprintf('Reading part %d of %d...', i, numparts))
     geno = cpp_read_eigenstrat(fl, nsnp, nindall, (indvec != 0)+0, start[i]-1, end[i], FALSE, verbose && numparts == 1)
     colnames(geno) = inds
     counts[start[i]:end[i],] = t(rowsum((!is.na(t(geno)))*ploidy, pops))[,upops]
@@ -541,7 +541,7 @@ plink_to_afs = function(pref, inds = NULL, pops = NULL, adjust_pseudohaploid = T
   else ploidy = rep(2, nindall)
 
   for(i in seq_len(numblocks)) {
-    if(numblocks > 1) alert_info(paste0('Reading block ', i,' of ', numblocks,'...\r'))
+    if(numblocks > 1) message(sprintf('Reading block %d of %d...', i, numblocks))
     dat = cpp_plink_to_afs(normalizePath(bedfile), nsnpall, nindall, indvec-1,
                            first = firsts[i]-1, last = lasts[i], ploidy, FALSE, verbose && numblocks == 1)
     if(poly_only) {
@@ -761,8 +761,7 @@ read_f2 = function(f2_dir, pops = NULL, pops2 = NULL, type = 'f2',
   for(i in seq_len(nrow(popcomb))) {
     pop1 = popcomb$pops[i]
     pop2 = popcomb$pops2[i]
-    if(verbose) alert_info(paste0('Reading ', type,
-                                  ' data for pair ', i, ' out of ', nrow(popcomb),'...\r'))
+    if(verbose) message(sprintf('Reading %s data for pair %d of %d...', type, i, nrow(popcomb)))
     fl = paste0(f2_dir, '/', popcomb$p1[i], '/', popcomb$p2[i], '_', type, '.rds')
     if(!file.exists(fl)) fl = paste0(f2_dir, '/', popcomb$p2[i], '/', popcomb$p1[i], '_', type, '.rds')
     if(!file.exists(fl)) stop(paste0('File ', fl, ' not found! You may have to recompute the f-statistics!'))
@@ -772,7 +771,6 @@ read_f2 = function(f2_dir, pops = NULL, pops2 = NULL, type = 'f2',
     if(type == 'fst' && pop1 == pop2) f2_blocks[pop1, pop1, ] = 0
     #if(any(is.na(dat))) warning(paste0('missing values in ', pop1, ' - ', pop2, '!'))
   }
-  if(verbose) alert_info(paste0('\n'))
   if(remove_na || verbose) {
     keep = apply(f2_blocks, 3, function(x) sum(!is.finite(x)) == 0)
     if(!all(keep)) {
@@ -855,12 +853,11 @@ split_mat = function(mat, cols_per_chunk, prefix, overwrite = TRUE, verbose = TR
   numparts = length(starts)
   ends = c(lead(starts)[-numparts]-1, npops)
   for(i in seq_len(numparts)) {
-    if(verbose) cat(paste0('\rpart ', i, ' of ', numparts))
+    if(verbose) message(sprintf('part %d of %d', i, numparts))
     spl = mat[, starts[i]:ends[i],drop=F]
     fl = paste0(prefix, i, '.rds')
     if(overwrite || !file.exists(fl)) saveRDS(spl, file = fl)
   }
-  if(verbose) cat('\n')
 }
 
 
@@ -966,12 +963,11 @@ write_split_inddat = function(genodir, outdir, overwrite = FALSE, maxmem = 8000,
 
   if(verbose) alert_info(paste0('Writing individual data from ', length(files), ' chunks\n'))
   for(i in seq_len(nfiles)) {
-    if(verbose) alert_info(paste0('Chunk ', i, ' out of ', nfiles, '\r'))
+    if(verbose) message(sprintf('Chunk %d of %d', i, nfiles))
     xmat = 2*readRDS(files[i])
     xmat_to_inddat(xmat, block_lengths, outdir = outdir, overwrite = overwrite,
                    maxmem = maxmem, verbose = FALSE)
   }
-  if(verbose) alert_info(paste0('\n'))
 }
 
 #' Compute count blocks and write them to disk
@@ -1253,7 +1249,7 @@ extract_f2_large = function(pref, outdir, inds = NULL, pops = NULL, blgsize = 0.
   consider running "extract_afs" and then paralellizing over "afs_to_f2".\n'))
   for(i in 1:numchunks) {
     for(j in i:numchunks) {
-      if(verbose) alert_info(paste0('Writing pair ', i, ' - ', j, '...\r'))
+      if(verbose) message(sprintf('Writing pair %d-%d...', i, j))
       afs_to_f2(outdir, outdir, chunk1 = i, chunk2 = j, blgsize = blgsize, snpdat = snpdat,
                 snpwt = snpwt, overwrite = overwrite, type = 'f2', poly_only = 'f2' %in% poly_only,
                 apply_corr = apply_corr)
@@ -1263,7 +1259,6 @@ extract_f2_large = function(pref, outdir, inds = NULL, pops = NULL, blgsize = 0.
                         snpwt = snpwt, overwrite = overwrite, type = 'fst', poly_only = 'fst' %in% poly_only)
     }
   }
-  if(verbose) alert_info('\n')
   if(verbose) alert_info(paste0('Deleting allele frequency files...\n'))
   unlink(paste0(outdir, c('/afs*.rds', '/counts*.rds')))
 }
@@ -1398,11 +1393,10 @@ extract_counts_large = function(pref, outdir, inds = NULL, blgsize = 0.05, cols_
   consider running "extract_afs" (with each individual its own population) and then paralellizing over "afs_to_counts".\n'))
   for(i in 1:numchunks) {
     for(j in i:numchunks) {
-      if(verbose) alert_info(paste0('Writing pair ', i, ' - ', j, '...\r'))
+      if(verbose) message(sprintf('Writing pair %d-%d...', i, j))
       afs_to_counts(outdir, outdir, chunk1 = i, chunk2 = j, overwrite = overwrite)
     }
   }
-  if(verbose) alert_info('\n')
   if(verbose) alert_info(paste0('Deleting allele frequency files...\n'))
   unlink(paste0(outdir, c('/afs*.rds', '/counts*.rds')))
 }
@@ -1535,7 +1529,7 @@ extract_afs = function(pref, outdir, inds = NULL, pops = NULL, cols_per_chunk = 
   else ploidy = rep(2, nindall)
 
   for(i in 1:numparts) {
-    if(verbose) alert_info(paste0('Reading part ', i, ' out of ', numparts, '...\r'))
+    if(verbose) message(sprintf('Reading part %d of %d...', i, numparts))
     # read data and compute allele frequencies
     afdat = l$cpp_geno_to_afs(paste0(pref, l$genoend), nsnpall, nindall, indvec, first = starts[i],
                                 last = ends[i], ploidy = ploidy, transpose = FALSE, verbose = FALSE)
@@ -1558,14 +1552,13 @@ extract_afs = function(pref, outdir, inds = NULL, pops = NULL, cols_per_chunk = 
     split_mat(afdat$afs, cols_per_chunk = cols_per_chunk, prefix = paste0(partdir,'/afs'), verbose = FALSE)
     split_mat(afdat$counts, cols_per_chunk = cols_per_chunk, prefix = paste0(partdir, '/counts'), verbose = FALSE)
   }
-  if(verbose) alert_info('\n')
   snpparts %<>% bind_rows %>% mutate(CHR = as.character(CHR))
   if(verbose) alert_warning(paste0(nrow(snpparts), ' SNPs remain after filtering. ',
                                    sum(snpparts$poly),' are polymorphic.\n'))
 
   numchunks = length(list.files(partdir, 'afs.+rds'))
   for(j in seq_len(numchunks)) {
-    if(verbose) alert_info(paste0('Merging chunk ', j, ' out of ', numchunks, '...\r'))
+    if(verbose) message(sprintf('Merging chunk %d of %d...', j, numchunks))
     am = cm = list()
     for(i in seq_len(numparts)) {
       partdir = paste0(outdir, '/part', i, '/')
@@ -1576,7 +1569,6 @@ extract_afs = function(pref, outdir, inds = NULL, pops = NULL, cols_per_chunk = 
     saveRDS(do.call(rbind, cm), file = paste0(outdir,'/counts', j, '.rds'))
   }
   unlink(paste0(outdir, '/part', seq_len(numparts), '/'), recursive = TRUE)
-  if(verbose) alert_info('\n')
 
   write_tsv(snpparts, paste0(outdir, '/snpdat.tsv.gz'))
   invisible(snpparts)
@@ -1913,7 +1905,7 @@ xmat_to_pairdat = function(xmat, block_lengths, maxmem = 8000,
   aa_list = nn_list = replicate(numsplits2, list())
 
   for(i in 1:ncol(cmb)) {
-    if(numsplits2 > 1 & verbose) alert_info(paste0('sample pair block ', i, ' out of ', ncol(cmb), '\r'))
+    if(numsplits2 > 1 & verbose) message(sprintf('sample pair block %d of %d', i, ncol(cmb)))
     c1 = cmb[1,i]
     c2 = cmb[2,i]
     s1 = starts[c1]:ends[c1]
@@ -1940,7 +1932,6 @@ xmat_to_pairdat = function(xmat, block_lengths, maxmem = 8000,
       nn_list[[c2]][[c1]] = aperm(nn_list[[c1]][[c2]], c(2,1,3))
     }
   }
-  if(numsplits2 > 1 & verbose) alert_info('\n')
 
   if(is.null(outdir)) {
     assemble_arrays = function(l)
@@ -2288,8 +2279,7 @@ f4blockdat_from_geno = function(pref, popcombs = NULL, left = NULL, right = NULL
 
   numer = denom = cnt = matrix(NA, numblocks, nrow(pc))
   for(i in 1:numblocks) {
-    if(verbose) alert_info(paste0('Computing ', nrow(pc),' f4-statistics for block ',
-                                  i, ' out of ', numblocks, '...\r'))
+    if(verbose) message(sprintf('Computing %d f4-statistics for block %d of %d...', nrow(pc), i, numblocks))
     # replace following two lines with cpp_geno_to_afs?
     gmat = cpp_read_geno(fl, nsnpall, nindall, indvec, start[i], end[i], T, F)[,snpind[[i]]]
     at = gmat_to_aftable(gmat, popvec)
@@ -2420,8 +2410,7 @@ f3blockdat_from_geno = function(pref, popcombs, auto_only = TRUE,
 
   numer = denom = cnt = matrix(NA, numblocks, nrow(pc))
   for(i in 1:numblocks) {
-    if(verbose) alert_info(paste0('Computing ', nrow(pc),' f3-statistics for block ',
-                                  i, ' out of ', numblocks, '...\r'))
+    if(verbose) message(sprintf('Computing %d f3-statistics for block %d of %d...', nrow(pc), i, numblocks))
     # replace following two lines with cpp_geno_to_afs?
     gmat = cpp_read_geno(fl, nsnpall, nindall, indvec, start[i], end[i], T, F)[,snpind[[i]],drop=F]
     ref = rowsum(gmat, popvec, na.rm = TRUE)
