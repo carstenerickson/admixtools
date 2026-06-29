@@ -101,7 +101,7 @@ graph_to_weightind = function(graph, root = NULL, admixedges = NULL) {
   path = path[ok]; edge2 = edge2[ok]
   leaf  = as.vector(ends[path]); leaf2 = match(leaf, leaves)
   numpaths = as.vector(table(ends)[as.character(leaf)])
-  cnt   = ave(seq_along(edge2), paste(leaf2, edge2, sep = '\r'), FUN = length)
+  cnt   = stats::ave(seq_along(edge2), paste(leaf2, edge2, sep = '\r'), FUN = length)
   keep  = cnt < numpaths
   path_edge_table = cbind(path = path, edge2 = edge2, leaf2 = leaf2)[keep, , drop = FALSE]
 
