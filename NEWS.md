@@ -178,6 +178,22 @@ Note: 18 new functions are exported in this release (see the lists below).
 
 ## Bug fixes
 
+* **Transposed PACKEDANCESTRYMAP (`TGENO`) files are now read correctly.**
+  Recent AADR releases (v62.0.p1 and v66 onwards) distribute their `.geno`
+  files in the transposed packed layout: a `TGENO` header and one row per
+  individual instead of one row per SNP. `read_packedancestrymap()`,
+  `packedancestrymap_to_afs()`, and everything built on them (`extract_f2()`,
+  `qpadm()`, `qpdstat()`, `qpgraph()`, `packedancestrymap_to_plink()`) inferred
+  the row size from the file size and read such files as if they were in the
+  original layout, returning chance-level genotypes with the right dimensions
+  and no error, and for some dimensions overrunning a heap buffer. The readers
+  now take the layout from the `.geno` header, reject files whose size or
+  `.ind`/`.snp` row counts do not match it, and decode `TGENO` rows per
+  individual; `TGENO` rows padded to 48 bytes, as written by
+  `plink2 --export eigt`, are accepted as well. **Any f-statistics computed from
+  a `TGENO` file with an earlier version are invalid and must be recomputed.**
+  (#173, #172)
+
 * **Upward bias in f2, f3, and f4 with `maxmiss > 0`.** Partly missing genotypes
   leaked through a `tidyr::replace_na()` call that does nothing on matrices,
   silently inflating f2, f3, and f4 statistics by roughly N/(N-k) for population
