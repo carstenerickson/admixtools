@@ -1,6 +1,11 @@
 
 #' Read allele frequencies from packedancestrymap files
 #'
+#' Reads allele frequencies and allele counts per population from a `.geno`/`.ind`/`.snp` triplet.
+#' Both packedancestrymap layouts are supported: the original `GENO` layout (one row per SNP) and
+#' the transposed `TGENO` layout (one row per individual) that recent AADR releases (v62.0.p1 and
+#' v66 onwards) distribute. The layout is detected from the `.geno` header.
+#'
 #' @export
 #' @param pref Prefix of packedancestrymap files (files have to end in `.geno`, `.ind`, `.snp`)
 #' @param inds Individuals from which to compute allele frequencies
@@ -365,13 +370,18 @@ discard_snps = function(snpdat, maxmiss = 1, keepsnps = NULL, auto_only = TRUE, 
 
 #' Read genotype data from packedancestrymap files
 #'
+#' Reads a `.geno`/`.ind`/`.snp` triplet in either packedancestrymap layout: the original `GENO`
+#' layout (one row per SNP) or the transposed `TGENO` layout (one row per individual) that recent
+#' AADR releases (v62.0.p1 and v66 onwards) distribute. The layout is detected from the `.geno`
+#' header, and a file whose size does not match its header is rejected instead of being misread.
+#'
 #' @export
 #' @param pref Prefix of the packedancestrymap files
 #' @param inds Individuals for which data should be read. Defaults to all individuals
 #' @param pops Populations for which data should be read. Cannot be provided together with 'inds'
 #' @param first Index of first SNP to read
 #' @param last Index of last SNP to read
-#' @param transpose Transpose genotype matrix (default is `snps` x `individuals`)
+#' @param transpose Transpose the returned genotype matrix (default is `snps` x `individuals`)
 #' @param verbose Print progress updates
 #' @return A list with the genotype data matrix (integer storage mode), the `.ind` file, and the `.snp` file
 #' @examples
@@ -407,16 +417,22 @@ read_packedancestrymap = function(pref, inds = NULL, pops = NULL, first = 1, las
   indfile %<>% filter(!is.na(.keep)) %>% select(-.keep)
 
   fl = paste0(pref, '.geno')
-  conn = file(fl, 'rb')
-  hd = strsplit(readBin(conn, 'character', n = 1), ' +')[[1]]
-  close(conn)
-  nindall = as.numeric(hd[2])
-  nsnpall = as.numeric(hd[3])
+  hd = read_packedancestrymap_header(fl)
+  nindall = hd$nind
+  nsnpall = hd$nsnp
   nind = length(inds)
   nsnp = min(last, nsnpall) - first + 1
+  if(length(indvec) != nindall) {
+    stop(paste0(basename(fl), ' declares ', nindall, ' individuals, but ', basename(pref), '.ind has ',
+                length(indvec), ' rows'))
+  }
+  if(nrow(snpfile) != nsnp) {
+    stop(paste0(basename(fl), ' declares ', nsnpall, ' SNPs, but ', basename(pref), '.snp has ',
+                nrow(snpfile), ' rows for the requested SNPs ', first, ' to ', min(last, nsnpall)))
+  }
 
   if(verbose) {
-    alert_info(paste0(basename(pref), '.geno has ', nindall, ' samples and ', nsnpall, ' SNPs.\n'))
+    alert_info(paste0(basename(pref), '.geno (', hd$format, ' layout) has ', nindall, ' samples and ', nsnpall, ' SNPs.\n'))
     alert_info(paste0('Reading data for ', nind, ' samples and ', nsnp, ' SNPs\n'))
     alert_info(paste0('Expected size of genotype data: ', round((nsnp*nind*8+nsnp*112)/1e6), ' MB\n'))
     # 8, 112: estimated scaling factors for AF columns and annotation columns
@@ -3098,6 +3114,35 @@ is_packed = function(filename) {
   on.exit(close(conn))
   dat = readBin(conn, 'int', 1e3, 1, signed=F)
   max(dat) > 128 || length(unique(dat)) > 5
+}
+
+read_packedancestrymap_header = function(genofile) {
+  # Parses the text header shared by both packedancestrymap layouts:
+  #   <GENO|TGENO> <nind> <nsnp> <indhash> <snphash>
+  # GENO is the original layout (one row per SNP); TGENO is the transposed
+  # layout (one row per individual) that recent AADR releases ship. The header
+  # text always fits in the first 48 bytes; the rest of the header is NUL
+  # padding. The C++ readers re-parse the header to pick the layout and check
+  # the file size; this R-level parse exists so that a file that is not a
+  # packedancestrymap file fails with a readable message. See
+  # https://github.com/DReichLab/AdmixTools/blob/master/transpose_info/transpose_format.txt
+  conn = file(genofile, 'rb')
+  on.exit(close(conn))
+  bytes = readBin(conn, 'raw', 48)
+  hd = character(0)
+  if(length(bytes) == 48) {
+    # The header is ASCII by construction; drop everything else before any
+    # string handling so that arbitrary binary input cannot trip encoding checks.
+    printable = bytes[bytes >= as.raw(0x20) & bytes <= as.raw(0x7e)]
+    hd = strsplit(trimws(rawToChar(printable)), ' +')[[1]]
+  }
+  ok = length(hd) >= 3 && hd[1] %in% c('GENO', 'TGENO') && all(grepl('^[0-9]+$', hd[2:3]))
+  counts = if(ok) as.numeric(hd[2:3]) else c(NA_real_, NA_real_)
+  if(!ok || any(counts > .Machine$integer.max)) {
+    stop(paste0(basename(genofile), " does not start with a 'GENO' (packedancestrymap) or 'TGENO' ",
+                "(transposed packedancestrymap) header with valid individual and SNP counts"))
+  }
+  list(format = hd[1], transposed = hd[1] == 'TGENO', nind = counts[1], nsnp = counts[2])
 }
 
 is_ancestrymap_prefix = function(input) {
