@@ -172,6 +172,22 @@ test_that("the header reports the layout and both wrappers see the same counts",
     writeBin(c(charToRaw('GENO 13 23 1a 2b'), raw(48 - 16)), con)
     close(con)
     expect_equal(admixtools:::read_packedancestrymap_header(paste0(prefs$geno, '.geno'))$nsnp, 23)
+    # The R helper and the C++ readers share one parser, so any whitespace
+    # between header fields is accepted by both, and the same file reads
+    # identically through read_packedancestrymap and packedancestrymap_to_afs.
+    con = file(paste0(prefs$geno, '.geno'), 'r+b')
+    writeBin(c(charToRaw('GENO\t13\t23\t1a\t2b'), raw(48 - 16)), con)
+    close(con)
+    expect_equal(admixtools:::read_packedancestrymap_header(paste0(prefs$geno, '.geno'))$nind, 13)
+    expect_identical(.read_geno_matrix(prefs$geno), .truth(dat))
+    expect_identical(.read_afs(prefs$geno)$afs, .read_afs(prefs$tgeno)$afs)
+    # Counts that are not non-negative integers are rejected as a bad header.
+    con = file(paste0(prefs$geno, '.geno'), 'r+b')
+    writeBin(c(charToRaw('GENO abc 23'), raw(48 - 11)), con)
+    close(con)
+    expect_error(admixtools:::read_packedancestrymap_header(paste0(prefs$geno, '.geno')),
+                 'valid individual and SNP counts')
+    expect_error(read_packedancestrymap(prefs$geno, verbose = FALSE), 'valid individual and SNP counts')
     # Progress messages go through cat(), so they are output rather than conditions.
     expect_output(read_packedancestrymap(prefs$tgeno, verbose = TRUE), 'TGENO layout')
   })
@@ -392,5 +408,80 @@ test_that("malformed files fail loudly instead of returning garbage", {
                                                          rep(1L, 100), 0L, 482L, FALSE, FALSE), 'indvec')
     expect_error(admixtools:::cpp_packedancestrymap_ploidy(paste0(prefs$geno, '.geno'), 482L, 266L,
                                                            rep(0L, 10), 100L), 'indvec')
+  })
+})
+
+test_that("invalid sample vectors and SNP windows are rejected before any genotype byte is read", {
+  withr::with_tempdir({
+    dat = make_packedancestrymap_dataset(482L, 266L)
+    prefs = write_both_layouts(getwd(), dat)
+    for(lay in c('geno', 'tgeno')) {
+      genofile = paste0(prefs[[lay]], '.geno')
+      # cpp_read_packedancestrymap sizes its output from the entries equal to
+      # 1, so any other nonzero entry (or NA) would write past the matrix.
+      for(bad in list(rep(2L, 266), c(NA_integer_, rep(1L, 265)), c(-1L, rep(1L, 265)))) {
+        expect_error(admixtools:::cpp_read_packedancestrymap(genofile, 482L, 266L, bad, 0L, 482L, FALSE, FALSE),
+                     'indvec', info = lay)
+      }
+      # The ploidy and allele-frequency readers take -1 (unused) or a
+      # population index; NA (INT_MIN) is neither.
+      expect_error(admixtools:::cpp_packedancestrymap_ploidy(genofile, 482L, 266L, c(NA_integer_, rep(0L, 265)), 100L),
+                   'indvec', info = lay)
+      expect_error(admixtools:::cpp_packedancestrymap_to_afs(genofile, 482L, 266L, c(-2L, rep(0L, 265)), 0L, 482L,
+                                                             rep(2L, 266), FALSE, FALSE), 'indvec', info = lay)
+      # A window outside the file is reported as such, not as a corrupt .snp file.
+      expect_error(read_packedancestrymap(prefs[[lay]], first = 500, verbose = FALSE), 'outside', info = lay)
+      expect_error(read_packedancestrymap(prefs[[lay]], first = 10, last = 5, verbose = FALSE), 'outside', info = lay)
+      expect_error(read_packedancestrymap(prefs[[lay]], first = 0, verbose = FALSE), 'outside', info = lay)
+      expect_error(read_packedancestrymap(prefs[[lay]], first = c(1, 2), verbose = FALSE), 'single whole', info = lay)
+      expect_error(read_packedancestrymap(prefs[[lay]], first = 2.5, verbose = FALSE), 'single whole', info = lay)
+      expect_error(read_packedancestrymap(prefs[[lay]], last = NA, verbose = FALSE), 'single whole', info = lay)
+      # A missing .geno is named in the error.
+      nogeno = copy_triplet(prefs[[lay]], file.path(getwd(), paste0('nogeno_', lay)))
+      file.remove(paste0(nogeno, '.geno'))
+      expect_error(read_packedancestrymap(nogeno, verbose = FALSE), 'Could not open genotype file .*nogeno', info = lay)
+      expect_error(packedancestrymap_to_afs(nogeno, verbose = FALSE), 'Could not open genotype file .*nogeno', info = lay)
+      # A .snp file that disagrees with the header is caught even when the
+      # requested window fits inside it.
+      short_snp = copy_triplet(prefs[[lay]], file.path(getwd(), paste0('short_snp_win_', lay)))
+      writeLines(readLines(paste0(short_snp, '.snp'))[1:100], paste0(short_snp, '.snp'))
+      expect_error(read_packedancestrymap(short_snp, first = 1, last = 50, verbose = FALSE), 'has 100 rows', info = lay)
+      expect_error(read_packedancestrymap(short_snp, first = 90, verbose = FALSE), 'has 100 rows', info = lay)
+      expect_error(read_packedancestrymap(short_snp, first = 200, verbose = FALSE), 'has 100 rows', info = lay)
+      long_snp = copy_triplet(prefs[[lay]], file.path(getwd(), paste0('long_snp_win_', lay)))
+      cat('rs_extra\t1\t1.5\t999999\tA\tC\n', file = paste0(long_snp, '.snp'), append = TRUE)
+      expect_error(read_packedancestrymap(long_snp, first = 1, last = 50, verbose = FALSE), 'has 483 rows', info = lay)
+      expect_error(read_packedancestrymap(long_snp, first = 400, verbose = FALSE), 'has 483 rows', info = lay)
+      # Blank lines in the .snp are not rows wherever they sit (readr's `skip`
+      # counts raw lines, so these exercise the whole-file fallback), in
+      # either read mode, and the window is taken from the right rows.
+      truth = .truth(dat)
+      lines = readLines(paste0(prefs[[lay]], '.snp'))
+      for(at in c(0, 5, 250, 481, 482)) {
+        blank = copy_triplet(prefs[[lay]], file.path(getwd(), paste0('blank_snp_', at, '_', lay)))
+        writeLines(append(lines, '', after = at), paste0(blank, '.snp'))
+        lab = paste(lay, 'blank after line', at)
+        expect_identical(.read_geno_matrix(blank), truth, info = lab)
+        expect_identical(.read_geno_matrix(blank, first = 3, last = 11), truth[3:11, ], info = lab)
+        expect_identical(.read_geno_matrix(blank, first = 300, last = 482), truth[300:482, ], info = lab)
+        expect_identical(.read_geno_matrix(blank, first = 400), truth[400:482, ], info = lab)
+      }
+    }
+    # A header that declares no SNPs still reads as an empty matrix. Both
+    # layouts are then a bare 48-byte header, so the TGENO file is the GENO
+    # file with its tag rewritten.
+    dat5 = make_packedancestrymap_dataset(4L, 5L)
+    geno0 = write_packedancestrymap_fixture(file.path(getwd(), 'nosnps_geno'), dat5$geno[0, , drop = FALSE],
+                                            dat5$ind, dat5$snp[0, ], transposed = FALSE)
+    expect_equal(file.size(paste0(geno0, '.geno')), 48)
+    tgeno0 = copy_triplet(geno0, file.path(getwd(), 'nosnps_tgeno'))
+    con = file(paste0(tgeno0, '.geno'), 'r+b')
+    writeBin(c(charToRaw('TGENO 5 0 0 0'), raw(48 - 13)), con)
+    close(con)
+    for(pref0 in c(geno0, tgeno0)) {
+      g0 = .read_geno_matrix(pref0)
+      expect_identical(dim(g0), c(0L, 5L), info = basename(pref0))
+      expect_identical(colnames(g0), dat5$ind$ind, info = basename(pref0))
+    }
   })
 })

@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <climits>
 
 using namespace Rcpp;
 
@@ -48,6 +49,66 @@ using namespace Rcpp;
 // file size matches it before any genotype byte is interpreted.
 // ---------------------------------------------------------------------------
 
+static const char* GENO_HEADER_DESC =
+  "a 'GENO' (packedancestrymap) or 'TGENO' (transposed packedancestrymap) header";
+
+struct GenoHeader {
+  std::string tag;        // "GENO" or "TGENO"
+  bool transposed;        // tag == "TGENO"
+  long long nind, nsnp;   // as declared in the header
+  long long filebytes;    // total file size
+};
+
+// Parses and validates the text header. This is the single parser for both
+// the readers below and the R-level read_packedancestrymap_header(), so R
+// and C++ agree on what counts as a valid header. It does not compare the
+// counts to anything; read_geno_layout does that.
+static GenoHeader parse_geno_header(std::ifstream& in, const std::string& path) {
+
+  in.seekg(0, std::ifstream::end);
+  long long len = (long long)in.tellg();
+  if(len < 48) {
+    stop("Genotype file %s has only %d bytes, too small for %s", path, len, GENO_HEADER_DESC);
+  }
+  char hdr[49] = {0};
+  in.seekg(0, std::ifstream::beg);
+  if(!in.read(hdr, 48)) {
+    stop("Could not read the header of genotype file %s", path);
+  }
+  std::istringstream ss(hdr);
+  GenoHeader h;
+  h.filebytes = len;
+  h.nind = h.nsnp = -1;
+  ss >> h.tag;
+  if(h.tag == "GENO") {
+    h.transposed = false;
+  } else if(h.tag == "TGENO") {
+    h.transposed = true;
+  } else {
+    stop("Genotype file %s does not start with %s", path, GENO_HEADER_DESC);
+  }
+  if(!(ss >> h.nind >> h.nsnp) || h.nind < 0 || h.nsnp < 0 || h.nind > INT_MAX || h.nsnp > INT_MAX) {
+    stop("Genotype file %s does not start with %s with valid individual and SNP counts",
+         path, GENO_HEADER_DESC);
+  }
+  return h;
+}
+
+// [[Rcpp::export]]
+List cpp_packedancestrymap_header(String genofile) {
+
+  // Header of a packedancestrymap file for the R wrappers: the layout tag,
+  // whether it is the transposed layout, and the declared counts.
+  const std::string path = genofile.get_cstring();
+  std::ifstream in(path.c_str(), std::ios::in | std::ios::binary);
+  if(!in) {
+    stop("Could not open genotype file %s", path);
+  }
+  GenoHeader h = parse_geno_header(in, path);
+  return List::create(_["format"] = h.tag, _["transposed"] = h.transposed,
+                      _["nind"] = (double)h.nind, _["nsnp"] = (double)h.nsnp);
+}
+
 struct GenoLayout {
   bool transposed;        // false: GENO (row per SNP); true: TGENO (row per individual)
   long long nind, nsnp;   // as declared in the header
@@ -55,8 +116,13 @@ struct GenoLayout {
   long long rowbytes;     // bytes per matrix row
 };
 
+// Checks the caller's view of the file (nsnp, nind, indvec) against the
+// header and the file size, and derives the matrix geometry. Every entry
+// of indvec must lie in [indmin, indmax]: {0, 1} for the genotype reader,
+// -1 (unused) or a population index for the ploidy and allele-frequency
+// readers. Anything else would index past the output buffers.
 static GenoLayout read_geno_layout(std::ifstream& in, const std::string& path, int nsnp, int nind,
-                                   const IntegerVector& indvec) {
+                                   const IntegerVector& indvec, int indmin, int indmax) {
 
   if(nsnp < 0 || nind < 0) {
     stop("Negative number of SNPs (%d) or individuals (%d) requested for %s", nsnp, nind, path);
@@ -65,43 +131,31 @@ static GenoLayout read_geno_layout(std::ifstream& in, const std::string& path, i
     stop("indvec has %d entries but %d individuals were expected for %s "
          "(does the .ind file match the genotype file?)", (int)indvec.size(), nind, path);
   }
-  in.seekg(0, std::ifstream::end);
-  long long len = (long long)in.tellg();
-  if(len < 48) {
-    stop("Genotype file %s has only %d bytes, too small for a packedancestrymap header", path, len);
+  for(int i = 0; i < nind; i++) {
+    if(indvec[i] == NA_INTEGER || indvec[i] < indmin || indvec[i] > indmax) {
+      stop("indvec entry %d is invalid (expected an integer between %d and %d) for %s",
+           i + 1, indmin, indmax, path);
+    }
   }
-  char hdr[49] = {0};
-  in.seekg(0, std::ifstream::beg);
-  if(!in.read(hdr, 48)) {
-    stop("Could not read the header of genotype file %s", path);
+  GenoHeader h = parse_geno_header(in, path);
+  if(h.nind != nind || h.nsnp != nsnp) {
+    stop("Header of %s declares %d individuals and %d SNPs, but the caller expected %d individuals "
+         "and %d SNPs (usually the row counts of the .ind and .snp files)", path, h.nind, h.nsnp, nind, nsnp);
   }
-  std::istringstream ss(hdr);
-  std::string tag;
-  long long hind = -1, hsnp = -1;
-  ss >> tag >> hind >> hsnp;
 
   GenoLayout g;
-  if(tag == "GENO") {
-    g.transposed = false;
-  } else if(tag == "TGENO") {
-    g.transposed = true;
-  } else {
-    stop("Genotype file %s does not start with a 'GENO' (packedancestrymap) or 'TGENO' "
-         "(transposed packedancestrymap) header", path);
-  }
-  if(hind != nind || hsnp != nsnp) {
-    stop("Header of %s declares %d individuals and %d SNPs, but the caller expected %d individuals "
-         "and %d SNPs (usually the row counts of the .ind and .snp files)", path, hind, hsnp, nind, nsnp);
-  }
-  g.nind = hind;
-  g.nsnp = hsnp;
+  g.transposed = h.transposed;
+  g.nind = h.nind;
+  g.nsnp = h.nsnp;
   long long nrows;
   if(g.transposed) {
     g.headerbytes = 48;
     g.rowbytes = (g.nsnp + 3) / 4;
     nrows = g.nind;
-    // plink2 pads short TGENO rows to the 48-byte header size.
-    if(g.rowbytes < 48 && len != g.headerbytes + g.rowbytes * nrows && len == g.headerbytes + 48 * nrows) {
+    // plink2 pads TGENO rows shorter than the 48-byte header to 48 bytes;
+    // the reference writer does not. The two file sizes never coincide when
+    // there is at least one row, and with no rows the row size is moot.
+    if(g.rowbytes < 48 && h.filebytes == g.headerbytes + 48 * nrows) {
       g.rowbytes = 48;
     }
   } else {
@@ -110,9 +164,9 @@ static GenoLayout read_geno_layout(std::ifstream& in, const std::string& path, i
     nrows = g.nsnp;
   }
   long long expected = g.headerbytes + g.rowbytes * nrows;
-  if(len != expected) {
+  if(h.filebytes != expected) {
     stop("Genotype file %s has %d bytes, but its %s header (%d individuals, %d SNPs) implies %d bytes",
-         path, len, tag, g.nind, g.nsnp, expected);
+         path, h.filebytes, h.tag, g.nind, g.nsnp, expected);
   }
   return g;
 }
@@ -121,6 +175,39 @@ static GenoLayout read_geno_layout(std::ifstream& in, const std::string& path, i
 static inline int unpack2(const unsigned char* row, long long k) {
   return (row[k >> 2] >> (6 - 2 * (k & 3))) & 3;
 }
+
+// One GENO row (all individuals of one SNP), with the read checked so that
+// an I/O error fails instead of decoding whatever the buffer held before.
+static inline void read_geno_row(std::ifstream& in, char* buf, long long nbytes, long long snp,
+                                 const std::string& path) {
+  if(!in.read(buf, nbytes)) {
+    stop("Could not read SNP %d from genotype file %s", snp + 1, path);
+  }
+}
+
+// The bytes of a TGENO row that hold SNPs [first, first + n): read_row()
+// fetches them for one individual, code(row, j) decodes SNP first + j.
+// Shared by the three TGENO readers so the offset arithmetic lives once.
+struct TgenoWindow {
+  long long first, firstbyte, nbytes;
+
+  TgenoWindow(long long first_, long long n)
+    : first(first_), firstbyte(first_ / PACK_DENSITY),
+      nbytes(n > 0 ? (first_ + n - 1) / PACK_DENSITY - firstbyte + 1 : 0) {}
+
+  void read_row(std::ifstream& in, const GenoLayout& g, long long i, std::vector<unsigned char>& row,
+                const std::string& path) const {
+    if(nbytes == 0) return;
+    in.seekg(g.headerbytes + i * g.rowbytes + firstbyte, std::ifstream::beg);
+    if(!in.read((char*)row.data(), nbytes)) {
+      stop("Could not read individual %d from genotype file %s", i + 1, path);
+    }
+  }
+
+  int code(const std::vector<unsigned char>& row, long long j) const {
+    return unpack2(row.data(), first - PACK_DENSITY * firstbyte + j);
+  }
+};
 
 
 // [[Rcpp::export]]
@@ -139,12 +226,13 @@ IntegerMatrix cpp_read_packedancestrymap(String genofile, int nsnp, int nind, In
   long long bytespersnp;
   int readsnps = last - first;
 
-  std::ifstream in(genofile.get_cstring(), std::ios::in | std::ios::binary);
+  const std::string path = genofile.get_cstring();
+  std::ifstream in(path.c_str(), std::ios::in | std::ios::binary);
 
   if(!in) {
-    stop("Genotype file not found!");
+    stop("Could not open genotype file %s", path);
   }
-  GenoLayout g = read_geno_layout(in, genofile.get_cstring(), nsnp, nind, indvec);
+  GenoLayout g = read_geno_layout(in, path, nsnp, nind, indvec, 0, 1);
   if(first < 0 || last > nsnp || readsnps < 0) {
     stop("SNP range [%d, %d) is outside the %d SNPs in the genotype file", first, last, nsnp);
   }
@@ -160,25 +248,21 @@ IntegerMatrix cpp_read_packedancestrymap(String genofile, int nsnp, int nind, In
   if(g.transposed) {
     // TGENO: one row per individual. For each kept individual read only
     // the bytes spanning SNPs [first, last) of its row.
-    if(readsnps > 0) {
-      long long firstbyte = first / PACK_DENSITY;
-      long long nbytes = (last - 1) / PACK_DENSITY - firstbyte + 1;
-      std::vector<unsigned char> row(nbytes);
-      int c = 0;
-      for(int i = 0; i < nind; i++) {
-        if(!indvec[i]) continue;
-        if(verbose && c % 1000 == 0) Rcout << "\r" << c/1000 << "k samples read...";
-        in.seekg(g.headerbytes + (long long)i * g.rowbytes + firstbyte, std::ifstream::beg);
-        in.read((char*)row.data(), nbytes);
-        for(int j = 0; j < readsnps; j++) {
-          val = unpack2(row.data(), (long long)first + j - PACK_DENSITY * firstbyte);
-          if(val != 3) {
-            if(transpose) geno(c, j) = val;
-            else geno(j, c) = val;
-          }
+    TgenoWindow w(first, readsnps);
+    std::vector<unsigned char> row(w.nbytes);
+    int c = 0;
+    for(int i = 0; i < nind; i++) {
+      if(!indvec[i]) continue;
+      if(verbose && c % 1000 == 0) Rcout << "\r" << c/1000 << "k samples read...";
+      w.read_row(in, g, i, row, path);
+      for(int j = 0; j < readsnps; j++) {
+        val = w.code(row, j);
+        if(val != 3) {
+          if(transpose) geno(c, j) = val;
+          else geno(j, c) = val;
         }
-        c++;
       }
+      c++;
     }
     if(verbose) Rcout << std::endl;
     in.close();
@@ -208,7 +292,7 @@ IntegerMatrix cpp_read_packedancestrymap(String genofile, int nsnp, int nind, In
     if(verbose && j % 1000 == 0) Rcout << "\r" << j/1000 << "k SNPs read...";
 
     // read raw genotypes
-    in.read(tmp.data(), sizeof(char) * bytespersnp);
+    read_geno_row(in, tmp.data(), bytespersnp, (long long)first + j, path);
 
     for(int l = 0; l < bytespersnp; l++) {
       if(!blockused[l]) continue;
@@ -261,25 +345,25 @@ NumericVector cpp_packedancestrymap_ploidy(String genofile, int nsnp, int nind, 
     stop("ntest must be a non-negative integer");
   }
   ntest = std::min(ntest, nsnp);
-  std::ifstream in(genofile.get_cstring(), std::ios::in | std::ios::binary);
+  const std::string path = genofile.get_cstring();
+  std::ifstream in(path.c_str(), std::ios::in | std::ios::binary);
   if(!in) {
-    stop("Genotype file not found!");
+    stop("Could not open genotype file %s", path);
   }
-  GenoLayout g = read_geno_layout(in, genofile.get_cstring(), nsnp, nind, indvec);
+  GenoLayout g = read_geno_layout(in, path, nsnp, nind, indvec, -1, INT_MAX);
 
   NumericVector ploidy(nind);
   ploidy.fill(1.0);
 
   if(g.transposed) {
     // TGENO: scan the first ntest SNPs of each used individual's row.
-    long long nbytes = (ntest + PACK_DENSITY - 1) / PACK_DENSITY;
-    std::vector<unsigned char> row(nbytes);
+    TgenoWindow w(0, ntest);
+    std::vector<unsigned char> row(w.nbytes);
     for(int i = 0; i < nind; i++) {
       if(indvec[i] == -1) continue;
-      in.seekg(g.headerbytes + (long long)i * g.rowbytes, std::ifstream::beg);
-      in.read((char*)row.data(), nbytes);
+      w.read_row(in, g, i, row, path);
       for(int j = 0; j < ntest; j++) {
-        if(unpack2(row.data(), j) == 1) {
+        if(w.code(row, j) == 1) {
           ploidy(i) = 2.0;
           break;
         }
@@ -302,7 +386,7 @@ NumericVector cpp_packedancestrymap_ploidy(String genofile, int nsnp, int nind, 
 
   in.seekg(g.headerbytes, std::ifstream::beg);
   for(int j = 0 ; j < ntest; j++) {
-    in.read((char*)tmp.data(), sizeof(char) * bytespersnp);
+    read_geno_row(in, (char*)tmp.data(), bytespersnp, j, path);
 
     for(int l = 0 ; l < bytespersnp; ++l) {
       if(!blockused[l]) continue;
@@ -337,12 +421,13 @@ List cpp_packedancestrymap_to_afs(String genofile, int nsnp, int nind, IntegerVe
   long long bytespersnp;
   int readsnps = std::min(nsnp, last?last:nsnp) - first;
 
-  std::ifstream in(genofile.get_cstring(), std::ios::in | std::ios::binary);
+  const std::string path = genofile.get_cstring();
+  std::ifstream in(path.c_str(), std::ios::in | std::ios::binary);
 
   if(!in) {
-    stop("Genotype file not found!");
+    stop("Could not open genotype file %s", path);
   }
-  GenoLayout g = read_geno_layout(in, genofile.get_cstring(), nsnp, nind, indvec);
+  GenoLayout g = read_geno_layout(in, path, nsnp, nind, indvec, -1, INT_MAX);
   if(first < 0 || readsnps < 0) {
     stop("SNP range starting at %d is outside the %d SNPs in the genotype file", first, nsnp);
   }
@@ -353,7 +438,6 @@ List cpp_packedancestrymap_to_afs(String genofile, int nsnp, int nind, IntegerVe
   int numpop = max(indvec)+1;
 
   NumericMatrix afs(transpose?numpop:readsnps, transpose?readsnps:numpop);
-  std::fill(afs.begin(), afs.end(), NA_REAL);
   NumericMatrix counts(transpose?numpop:readsnps, transpose?readsnps:numpop);
   std::fill(counts.begin(), counts.end(), 0.0);
 
@@ -362,42 +446,33 @@ List cpp_packedancestrymap_to_afs(String genofile, int nsnp, int nind, IntegerVe
     // `afs` and observed alleles into `counts`, then normalise in place.
     // Contributions to each cell are added in ascending individual order,
     // as in the GENO branch, so both layouts give identical numbers.
-    if(readsnps > 0) {
-      std::fill(afs.begin(), afs.end(), 0.0);
-      long long firstbyte = first / PACK_DENSITY;
-      long long nbytes = ((long long)first + readsnps - 1) / PACK_DENSITY - firstbyte + 1;
-      std::vector<unsigned char> row(nbytes);
-      int c = 0;
-      for(int i = 0; i < nind; i++) {
-        if(indvec[i] == -1) continue;
-        if(verbose && c % 1000 == 0) Rcout << "\r" << c/1000 << "k samples read...";
-        c++;
-        pop = indvec(i);
-        in.seekg(g.headerbytes + (long long)i * g.rowbytes + firstbyte, std::ifstream::beg);
-        in.read((char*)row.data(), nbytes);
-        for(int j = 0; j < readsnps; j++) {
-          val = unpack2(row.data(), (long long)first + j - PACK_DENSITY * firstbyte);
-          if(val != 3) {
-            if(!transpose) {
-              afs(j, pop) += val / (3.0-ploidy(i));
-              counts(j, pop) += ploidy(i);
-            } else {
-              afs(pop, j) += val / (3.0-ploidy(i));
-              counts(pop, j) += ploidy(i);
-            }
-          }
+    std::fill(afs.begin(), afs.end(), 0.0);
+    // (SNP j, population p) cell of a result matrix in either orientation.
+    auto cell = [&](NumericMatrix& m, int j, int p) -> double& {
+      return transpose ? m(p, j) : m(j, p);
+    };
+    TgenoWindow w(first, readsnps);
+    std::vector<unsigned char> row(w.nbytes);
+    int c = 0;
+    for(int i = 0; i < nind; i++) {
+      if(indvec[i] == -1) continue;
+      if(verbose && c % 1000 == 0) Rcout << "\r" << c/1000 << "k samples read...";
+      c++;
+      pop = indvec(i);
+      w.read_row(in, g, i, row, path);
+      for(int j = 0; j < readsnps; j++) {
+        val = w.code(row, j);
+        if(val != 3) {
+          cell(afs, j, pop) += val / (3.0-ploidy(i));
+          cell(counts, j, pop) += ploidy(i);
         }
       }
-      for(int j = 0; j < readsnps; j++) {
-        for(int p = 0; p < numpop; p++) {
-          if(!transpose) {
-            if(counts(j, p) > 0) afs(j, p) = afs(j, p) / counts(j, p);
-            else afs(j, p) = NA_REAL;
-          } else {
-            if(counts(p, j) > 0) afs(p, j) = afs(p, j) / counts(p, j);
-            else afs(p, j) = NA_REAL;
-          }
-        }
+    }
+    for(int j = 0; j < readsnps; j++) {
+      for(int p = 0; p < numpop; p++) {
+        double& a = cell(afs, j, p);
+        double n = cell(counts, j, p);
+        a = n > 0 ? a / n : NA_REAL;
       }
     }
     if(verbose) Rcout << std::endl;
@@ -405,6 +480,8 @@ List cpp_packedancestrymap_to_afs(String genofile, int nsnp, int nind, IntegerVe
     return Rcpp::List::create(_["afs"] = afs, _["counts"] = counts);
   }
 
+  // GENO: cells with no observed alleles stay NA.
+  std::fill(afs.begin(), afs.end(), NA_REAL);
   bytespersnp = g.rowbytes;
 
   std::vector<int> blockused(bytespersnp, 0);
@@ -429,7 +506,7 @@ List cpp_packedancestrymap_to_afs(String genofile, int nsnp, int nind, IntegerVe
     if(verbose && j % 1000 == 0) Rcout << "\r" << j/1000 << "k SNPs read...";
 
     // read raw genotypes
-    in.read((char*)tmp.data(), sizeof(char) * bytespersnp);
+    read_geno_row(in, (char*)tmp.data(), bytespersnp, (long long)first + j, path);
 
     for(int l = 0 ; l < bytespersnp; ++l) {
       if(!blockused[l]) continue;

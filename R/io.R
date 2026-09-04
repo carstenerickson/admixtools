@@ -398,8 +398,6 @@ read_packedancestrymap = function(pref, inds = NULL, pops = NULL, first = 1, las
   pref = normalizePath(pref, mustWork = FALSE)
   nam = c('SNP', 'CHR', 'cm', 'POS', 'A1', 'A2')
   indfile = read_table(paste0(pref, '.ind'), col_names = FALSE, col_types = 'ccc', progress = FALSE)
-  snpfile = read_table(paste0(pref, '.snp'), col_names = nam, col_types = 'ccddcc', skip = first-1,
-                        n_max = last-first+1, progress = FALSE)
   if(!is.null(pops)) {
     if(!is.null(inds)) stop("'inds' and 'pops' cannot both be provided!")
     inds = indfile %>% filter(X3 %in% pops) %>% pull(X1)
@@ -421,14 +419,44 @@ read_packedancestrymap = function(pref, inds = NULL, pops = NULL, first = 1, las
   nindall = hd$nind
   nsnpall = hd$nsnp
   nind = length(inds)
-  nsnp = min(last, nsnpall) - first + 1
   if(length(indvec) != nindall) {
     stop(paste0(basename(fl), ' declares ', nindall, ' individuals, but ', basename(pref), '.ind has ',
                 length(indvec), ' rows'))
   }
-  if(nrow(snpfile) != nsnp) {
-    stop(paste0(basename(fl), ' declares ', nsnpall, ' SNPs, but ', basename(pref), '.snp has ',
-                nrow(snpfile), ' rows for the requested SNPs ', first, ' to ', min(last, nsnpall)))
+  if(!is.numeric(first) || !is.numeric(last) || length(first) != 1 || length(last) != 1 ||
+     is.na(first) || is.na(last) || first != floor(first) || last != floor(last)) {
+    stop("'first' and 'last' must be single whole numbers")
+  }
+  if(first < 1 || first > max(1, nsnpall) || last < first) {
+    stop(paste0("SNP range 'first' = ", first, " to 'last' = ", last, ' is outside the ', nsnpall,
+                ' SNPs in ', basename(fl)))
+  }
+  to_eof = is.infinite(last)
+  last = min(last, nsnpall)
+  nsnp = last - first + 1
+  # Only the requested window of the .snp file is parsed, and its row count is
+  # checked against the header: a read to the end of the file gives the count
+  # directly, and for a shorter window a two-row probe at row nsnpall tells
+  # whether the file ends there. readr's `skip` counts raw lines while blank
+  # lines are not data rows, so a blank line ahead of the window can make
+  # these cheap checks disagree with a correct file; that case and every
+  # genuine mismatch are settled by parsing the whole file once.
+  read_snp = function(...) {
+    x = read_table(paste0(pref, '.snp'), col_names = nam, col_types = 'ccddcc', progress = FALSE, ...)
+    # readr returns a tibble without columns for an empty file.
+    if(ncol(x) == 0) x = tibble::tibble(SNP = character(), CHR = character(), cm = numeric(),
+                                        POS = numeric(), A1 = character(), A2 = character())
+    x
+  }
+  snpfile = read_snp(skip = first-1, n_max = if(to_eof) Inf else nsnp)
+  snp_ok = nrow(snpfile) == nsnp && (to_eof || nrow(read_snp(skip = nsnpall-1, n_max = 2)) == 1)
+  if(!snp_ok) {
+    snpfile = read_snp()
+    if(nrow(snpfile) != nsnpall) {
+      stop(paste0(basename(fl), ' declares ', nsnpall, ' SNPs, but ', basename(pref), '.snp has ',
+                  nrow(snpfile), ' rows'))
+    }
+    snpfile %<>% slice(seq_len(nsnp) + first - 1)
   }
 
   if(verbose) {
@@ -441,7 +469,7 @@ read_packedancestrymap = function(pref, inds = NULL, pops = NULL, first = 1, las
   #print(c(fl, nsnpall, nindall, indvec, first = first-1,
   #        last = min(last, nsnpall), transpose = transpose, verbose = verbose))
   geno = cpp_read_packedancestrymap(fl, nsnpall, nindall, indvec, first = first-1,
-                                    last = min(last, nsnpall), transpose = transpose, verbose = verbose)
+                                    last = last, transpose = transpose, verbose = verbose)
 
   if(!transpose) {
     colnames(geno) = inds
@@ -3120,29 +3148,13 @@ read_packedancestrymap_header = function(genofile) {
   # Parses the text header shared by both packedancestrymap layouts:
   #   <GENO|TGENO> <nind> <nsnp> <indhash> <snphash>
   # GENO is the original layout (one row per SNP); TGENO is the transposed
-  # layout (one row per individual) that recent AADR releases ship. The header
-  # text always fits in the first 48 bytes; the rest of the header is NUL
-  # padding. The C++ readers re-parse the header to pick the layout and check
-  # the file size; this R-level parse exists so that a file that is not a
-  # packedancestrymap file fails with a readable message. See
+  # layout (one row per individual) that recent AADR releases ship. The parse
+  # is done by the same C++ code the readers use (parse_geno_header in
+  # cpp_readgeno.cpp), so R and C++ agree on what counts as a valid header
+  # and a file that is not a packedancestrymap file fails with a readable
+  # message before anything is read. See
   # https://github.com/DReichLab/AdmixTools/blob/master/transpose_info/transpose_format.txt
-  conn = file(genofile, 'rb')
-  on.exit(close(conn))
-  bytes = readBin(conn, 'raw', 48)
-  hd = character(0)
-  if(length(bytes) == 48) {
-    # The header is ASCII by construction; drop everything else before any
-    # string handling so that arbitrary binary input cannot trip encoding checks.
-    printable = bytes[bytes >= as.raw(0x20) & bytes <= as.raw(0x7e)]
-    hd = strsplit(trimws(rawToChar(printable)), ' +')[[1]]
-  }
-  ok = length(hd) >= 3 && hd[1] %in% c('GENO', 'TGENO') && all(grepl('^[0-9]+$', hd[2:3]))
-  counts = if(ok) as.numeric(hd[2:3]) else c(NA_real_, NA_real_)
-  if(!ok || any(counts > .Machine$integer.max)) {
-    stop(paste0(basename(genofile), " does not start with a 'GENO' (packedancestrymap) or 'TGENO' ",
-                "(transposed packedancestrymap) header with valid individual and SNP counts"))
-  }
-  list(format = hd[1], transposed = hd[1] == 'TGENO', nind = counts[1], nsnp = counts[2])
+  cpp_packedancestrymap_header(path.expand(genofile))
 }
 
 is_ancestrymap_prefix = function(input) {
