@@ -429,10 +429,11 @@ test_that("invalid sample vectors and SNP windows are rejected before any genoty
                    'indvec', info = lay)
       expect_error(admixtools:::cpp_packedancestrymap_to_afs(genofile, 482L, 266L, c(-2L, rep(0L, 265)), 0L, 482L,
                                                              rep(2L, 266), FALSE, FALSE), 'indvec', info = lay)
-      # A window outside the file is reported as such, not as a corrupt .snp file.
-      expect_error(read_packedancestrymap(prefs[[lay]], first = 500, verbose = FALSE), 'outside', info = lay)
-      expect_error(read_packedancestrymap(prefs[[lay]], first = 10, last = 5, verbose = FALSE), 'outside', info = lay)
-      expect_error(read_packedancestrymap(prefs[[lay]], first = 0, verbose = FALSE), 'outside', info = lay)
+      # An inverted or non-positive window is an error, not a corrupt .snp
+      # file; a window that starts past the last SNP is empty (tested below).
+      expect_error(read_packedancestrymap(prefs[[lay]], first = 10, last = 5, verbose = FALSE), 'is invalid', info = lay)
+      expect_error(read_packedancestrymap(prefs[[lay]], first = 500, last = 10, verbose = FALSE), 'is invalid', info = lay)
+      expect_error(read_packedancestrymap(prefs[[lay]], first = 0, verbose = FALSE), 'is invalid', info = lay)
       expect_error(read_packedancestrymap(prefs[[lay]], first = c(1, 2), verbose = FALSE), 'single whole', info = lay)
       expect_error(read_packedancestrymap(prefs[[lay]], first = 2.5, verbose = FALSE), 'single whole', info = lay)
       expect_error(read_packedancestrymap(prefs[[lay]], last = NA, verbose = FALSE), 'single whole', info = lay)
@@ -483,5 +484,131 @@ test_that("invalid sample vectors and SNP windows are rejected before any genoty
       expect_identical(dim(g0), c(0L, 5L), info = basename(pref0))
       expect_identical(colnames(g0), dat5$ind$ind, info = basename(pref0))
     }
+  })
+})
+
+test_that("windows past the end are empty, so a chunked loop can stop on an empty result", {
+  withr::with_tempdir({
+    dat = make_packedancestrymap_dataset(482L, 266L)
+    prefs = write_both_layouts(getwd(), dat)
+    truth = .truth(dat)
+    windows = list(list(first = 483), list(first = 500), list(first = 483, last = 482),
+                   list(first = 600, last = 700), list(first = 5, last = 4), list(first = 1, last = 0))
+    for(lay in c('geno', 'tgeno')) {
+      for(w in windows) {
+        lab = paste(lay, paste(names(w), unlist(w), collapse = ' '))
+        res = do.call(read_packedancestrymap, c(list(prefs[[lay]], verbose = FALSE), w))
+        expect_identical(dim(res$geno), c(0L, 266L), info = lab)
+        expect_identical(colnames(res$geno), dat$ind$ind, info = lab)
+        expect_identical(nrow(res$snp), 0L, info = lab)
+        expect_identical(names(res$snp), c('SNP', 'CHR', 'cm', 'POS', 'A1', 'A2'), info = lab)
+        tr = do.call(read_packedancestrymap, c(list(prefs[[lay]], transpose = TRUE, verbose = FALSE), w))
+        expect_identical(dim(tr$geno), c(266L, 0L), info = lab)
+      }
+      # Fixed-size chunks until the first empty one reassemble the matrix.
+      chunks = list()
+      first = 1
+      repeat {
+        g = .read_geno_matrix(prefs[[lay]], first = first, last = first + 99)
+        if(nrow(g) == 0) break
+        chunks[[length(chunks) + 1]] = g
+        first = first + 100
+      }
+      expect_identical(do.call(rbind, chunks), truth, info = lay)
+    }
+  })
+})
+
+test_that("whitespace-only .snp lines are blank lines, and CRLF files take the fast path", {
+  withr::with_tempdir({
+    dat = make_packedancestrymap_dataset(482L, 266L)
+    prefs = write_both_layouts(getwd(), dat)
+    truth = .truth(dat)
+    for(lay in c('geno', 'tgeno')) {
+      lines = readLines(paste0(prefs[[lay]], '.snp'))
+      spaces = c('   ', '\t', ' \t ')
+      for(k in seq_along(spaces)) for(at in c(0, 5, 481, 482)) {
+        f = copy_triplet(prefs[[lay]], file.path(getwd(), paste0('ws', k, '_', at, '_', lay)))
+        writeLines(append(lines, spaces[k], after = at), paste0(f, '.snp'))
+        lab = paste(lay, 'whitespace line', k, 'after line', at)
+        expect_identical(.read_geno_matrix(f), truth, info = lab)
+        expect_identical(.read_geno_matrix(f, first = 3, last = 11), truth[3:11, ], info = lab)
+        expect_identical(.read_geno_matrix(f, first = 400), truth[400:482, ], info = lab)
+      }
+      # A whitespace-only line does not hide a real extra row.
+      f = copy_triplet(prefs[[lay]], file.path(getwd(), paste0('ws_extra_', lay)))
+      writeLines(c(lines, '   ', 'rs_extra\t1\t1.5\t999999\tA\tC'), paste0(f, '.snp'))
+      expect_error(read_packedancestrymap(f, first = 1, last = 10, verbose = FALSE), 'has 483 rows', info = lay)
+      # CRLF line endings, no blank lines: clean, so only the window is parsed.
+      f = copy_triplet(prefs[[lay]], file.path(getwd(), paste0('crlf_', lay)))
+      con = file(paste0(f, '.snp'), 'wb')
+      writeLines(lines, con, sep = '\r\n')
+      close(con)
+      expect_true(admixtools:::cpp_count_text_rows(paste0(f, '.snp'))$clean, info = lay)
+      expect_identical(.read_geno_matrix(f, first = 3, last = 11), truth[3:11, ], info = lay)
+      expect_identical(.read_geno_matrix(f), truth, info = lay)
+    }
+  })
+})
+
+test_that("cpp_count_text_rows counts the lines that hold text", {
+  withr::with_tempdir({
+    count = function(text) {
+      writeBin(charToRaw(text), 'f.txt')
+      admixtools:::cpp_count_text_rows('f.txt')
+    }
+    expect_identical(count(''), list(rows = 0, clean = TRUE))
+    expect_identical(count('a\nb\n'), list(rows = 2, clean = TRUE))
+    expect_identical(count('a\nb'), list(rows = 2, clean = TRUE))
+    expect_identical(count('a\r\nb\r\n'), list(rows = 2, clean = TRUE))
+    expect_identical(count('  a\n\tb\n'), list(rows = 2, clean = TRUE))
+    expect_identical(count('a\n\nb\n'), list(rows = 2, clean = FALSE))
+    expect_identical(count('a\n  \nb\n'), list(rows = 2, clean = FALSE))
+    expect_identical(count('a\nb\n \t'), list(rows = 2, clean = FALSE))
+    expect_identical(count('\r\n'), list(rows = 0, clean = FALSE))
+    # Lines that straddle the 1 MiB read buffer, in both states.
+    expect_identical(count(paste0(strrep('x', 3e6), '\n', strrep(' ', 2^20 - 1), '\n', 'y')),
+                     list(rows = 2, clean = FALSE))
+    expect_identical(count(paste0(strrep(' ', 2^20 + 7), 'z\n', strrep('w', 2^20), '\n')),
+                     list(rows = 2, clean = TRUE))
+    expect_error(admixtools:::cpp_count_text_rows('missing.txt'), 'Could not open')
+  })
+})
+
+test_that("counts in error messages are printed in full, not in scientific notation", {
+  withr::with_tempdir({
+    # The .geno files are bare headers declaring round counts; the R-level
+    # checks fire before the C++ size check would.
+    header = function(text) writeBin(c(charToRaw(text), raw(48 - nchar(text))), 'big.geno')
+    writeLines('ind1\tU\tpopA', 'big.ind')
+    writeLines(c('rs1\t1\t0\t1\tA\tC', 'rs2\t1\t0\t2\tA\tC'), 'big.snp')
+    header('GENO 1 2000000 0 0')
+    expect_error(read_packedancestrymap('big', verbose = FALSE), 'declares 2000000 SNPs, but big.snp has 2 rows')
+    expect_error(read_packedancestrymap('big', first = 0, verbose = FALSE), 'invalid for the 2000000 SNPs')
+    header('GENO 1000000 2 0 0')
+    expect_error(read_packedancestrymap('big', verbose = FALSE), 'declares 1000000 individuals')
+  })
+})
+
+test_that("the .snp row count is cached per file and refreshed when the file changes", {
+  withr::with_tempdir({
+    dat = make_packedancestrymap_dataset(482L, 266L)
+    prefs = write_both_layouts(getwd(), dat)
+    truth = .truth(dat)
+    snp = normalizePath(paste0(prefs$geno, '.snp'))
+    calls = 0
+    real = admixtools:::cpp_count_text_rows
+    testthat::local_mocked_bindings(cpp_count_text_rows = function(file) { calls <<- calls + 1; real(file) },
+                                    .package = 'admixtools')
+    for(first in c(1, 101, 201, 301, 401)) {
+      expect_identical(.read_geno_matrix(prefs$geno, first = first, last = first + 99),
+                       truth[first:min(first + 99, 482), ], info = first)
+    }
+    expect_identical(calls, 1)
+    # Appending a row changes the file, so the next read counts again and
+    # reports the mismatch instead of trusting the cached count.
+    cat('rs_extra\t1\t1.5\t999999\tA\tC\n', file = snp, append = TRUE)
+    expect_error(read_packedancestrymap(prefs$geno, first = 1, last = 10, verbose = FALSE), 'has 483 rows')
+    expect_identical(calls, 2)
   })
 })

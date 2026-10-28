@@ -368,6 +368,25 @@ discard_snps = function(snpdat, maxmiss = 1, keepsnps = NULL, auto_only = TRUE, 
 
 
 
+# Data rows of a .snp file, as counted by cpp_count_text_rows(), cached per
+# file so that reading a large panel in many windows scans its .snp once
+# rather than on every call. The key includes the size, modification and
+# status-change times, so any rewrite of the file invalidates its entry.
+.snp_rows_cache = new.env(parent = emptyenv())
+count_snp_rows = function(path) {
+  info = file.info(path, extra_cols = FALSE)
+  if(is.na(info$size)) return(cpp_count_text_rows(path))
+  key = paste(path, info$size, format(as.numeric(info$mtime), digits = 22),
+              format(as.numeric(info$ctime), digits = 22), sep = '\r')
+  hit = .snp_rows_cache[[key]]
+  if(is.null(hit)) {
+    hit = cpp_count_text_rows(path)
+    assign(key, hit, envir = .snp_rows_cache)
+  }
+  hit
+}
+
+
 #' Read genotype data from packedancestrymap files
 #'
 #' Reads a `.geno`/`.ind`/`.snp` triplet in either packedancestrymap layout: the original `GENO`
@@ -419,50 +438,65 @@ read_packedancestrymap = function(pref, inds = NULL, pops = NULL, first = 1, las
   nindall = hd$nind
   nsnpall = hd$nsnp
   nind = length(inds)
+  num = function(x) format(x, scientific = FALSE, trim = TRUE)
   if(length(indvec) != nindall) {
-    stop(paste0(basename(fl), ' declares ', nindall, ' individuals, but ', basename(pref), '.ind has ',
-                length(indvec), ' rows'))
+    stop(paste0(basename(fl), ' declares ', num(nindall), ' individuals, but ', basename(pref), '.ind has ',
+                num(length(indvec)), ' rows'))
   }
   if(!is.numeric(first) || !is.numeric(last) || length(first) != 1 || length(last) != 1 ||
      is.na(first) || is.na(last) || first != floor(first) || last != floor(last)) {
     stop("'first' and 'last' must be single whole numbers")
   }
-  if(first < 1 || first > max(1, nsnpall) || last < first) {
-    stop(paste0("SNP range 'first' = ", first, " to 'last' = ", last, ' is outside the ', nsnpall,
-                ' SNPs in ', basename(fl)))
+  if(first < 1 || last < first - 1) {
+    stop(paste0("SNP range 'first' = ", num(first), " to 'last' = ", num(last), ' is invalid for the ',
+                num(nsnpall), ' SNPs in ', basename(fl), ": 'first' must be at least 1 and 'last' at ",
+                "least 'first' - 1"))
   }
-  to_eof = is.infinite(last)
+  # A window that starts past the last SNP is empty, as is last = first - 1,
+  # so a loop that reads fixed-size chunks can stop on an empty result.
+  if(first > nsnpall) {
+    first = nsnpall + 1
+    last = nsnpall
+  }
   last = min(last, nsnpall)
   nsnp = last - first + 1
-  # Only the requested window of the .snp file is parsed, and its row count is
-  # checked against the header: a read to the end of the file gives the count
-  # directly, and for a shorter window a two-row probe at row nsnpall tells
-  # whether the file ends there. readr's `skip` counts raw lines while blank
-  # lines are not data rows, so a blank line ahead of the window can make
-  # these cheap checks disagree with a correct file; that case and every
-  # genuine mismatch are settled by parsing the whole file once.
-  read_snp = function(...) {
-    x = read_table(paste0(pref, '.snp'), col_names = nam, col_types = 'ccddcc', progress = FALSE, ...)
+  # The .snp file must have exactly one row per SNP in the header, but only
+  # the requested window is parsed. The rows are counted by count_snp_rows(),
+  # one C++ pass over the file that is cached per file, so a loop that reads a
+  # panel in many windows scans its .snp once. readr's `skip` counts raw lines,
+  # and readr turns a whitespace-only line into a row of NAs with a
+  # parsing-failure warning, so a file with blank or whitespace-only lines
+  # (real .snp files have none) is parsed whole after those lines are removed.
+  snp_path = path.expand(paste0(pref, '.snp'))
+  empty_snp = tibble::tibble(SNP = character(), CHR = character(), cm = numeric(),
+                             POS = numeric(), A1 = character(), A2 = character())
+  read_snp_text = function(file, ...) {
+    x = read_table(file, col_names = nam, col_types = 'ccddcc', progress = FALSE, ...)
     # readr returns a tibble without columns for an empty file.
-    if(ncol(x) == 0) x = tibble::tibble(SNP = character(), CHR = character(), cm = numeric(),
-                                        POS = numeric(), A1 = character(), A2 = character())
-    x
+    if(ncol(x) == 0) empty_snp else x
   }
-  snpfile = read_snp(skip = first-1, n_max = if(to_eof) Inf else nsnp)
-  snp_ok = nrow(snpfile) == nsnp && (to_eof || nrow(read_snp(skip = nsnpall-1, n_max = 2)) == 1)
-  if(!snp_ok) {
-    snpfile = read_snp()
+  snp_rows = count_snp_rows(snp_path)
+  if(snp_rows$rows != nsnpall) {
+    stop(paste0(basename(fl), ' declares ', num(nsnpall), ' SNPs, but ', basename(pref), '.snp has ',
+                num(snp_rows$rows), ' rows'))
+  }
+  snpfile = if(nsnp == 0) empty_snp else if(snp_rows$clean) read_snp_text(snp_path, skip = first - 1, n_max = nsnp)
+  if(is.null(snpfile) || nrow(snpfile) != nsnp) {
+    lines = read_lines(snp_path, progress = FALSE)
+    lines = lines[grepl('[^[:space:]]', lines)]
+    snpfile = if(length(lines) == 0) empty_snp else read_snp_text(paste0(paste(lines, collapse = '\n'), '\n'))
     if(nrow(snpfile) != nsnpall) {
-      stop(paste0(basename(fl), ' declares ', nsnpall, ' SNPs, but ', basename(pref), '.snp has ',
-                  nrow(snpfile), ' rows'))
+      stop(paste0(basename(fl), ' declares ', num(nsnpall), ' SNPs, but ', basename(pref), '.snp has ',
+                  num(nrow(snpfile)), ' rows'))
     }
     snpfile %<>% slice(seq_len(nsnp) + first - 1)
   }
 
   if(verbose) {
-    alert_info(paste0(basename(pref), '.geno (', hd$format, ' layout) has ', nindall, ' samples and ', nsnpall, ' SNPs.\n'))
-    alert_info(paste0('Reading data for ', nind, ' samples and ', nsnp, ' SNPs\n'))
-    alert_info(paste0('Expected size of genotype data: ', round((nsnp*nind*8+nsnp*112)/1e6), ' MB\n'))
+    alert_info(paste0(basename(pref), '.geno (', hd$format, ' layout) has ', num(nindall), ' samples and ',
+                      num(nsnpall), ' SNPs.\n'))
+    alert_info(paste0('Reading data for ', num(nind), ' samples and ', num(nsnp), ' SNPs\n'))
+    alert_info(paste0('Expected size of genotype data: ', num(round((nsnp*nind*8+nsnp*112)/1e6)), ' MB\n'))
     # 8, 112: estimated scaling factors for AF columns and annotation columns
   }
 
